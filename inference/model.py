@@ -14,6 +14,7 @@ world_size = 1
 rank = 0
 block_size = 128
 
+
 @dataclass
 class ModelArgs:
     """
@@ -88,6 +89,7 @@ class ModelArgs:
     index_n_heads: int = 64
     index_head_dim: int = 128
     index_topk: int = 2048
+
 
 class ParallelEmbedding(nn.Module):
     """
@@ -452,7 +454,6 @@ class Indexer(torch.nn.Module):
 
         self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.head_dim, dtype=torch.float8_e4m3fn), persistent=False)
         self.register_buffer("k_scale_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.head_dim // block_size, dtype=torch.float32), persistent=False)
-
 
     def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
         bsz, seqlen, _ = x.size()
