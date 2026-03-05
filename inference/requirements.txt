@@ -1,5 +1,5 @@
-torch
-transformers
-safetensors
-fast_hadamard_transform
+torch>=2.4.0,<3.0.0
+transformers>=4.46.0,<6.0.0
+safetensors>=0.4.3,<1.0.0
+fast_hadamard_transform>=1.0.0,<2.0.0
 tilelang==0.1.6

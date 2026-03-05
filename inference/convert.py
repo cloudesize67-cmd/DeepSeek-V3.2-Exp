@@ -7,6 +7,8 @@ from tqdm import tqdm, trange
 import torch
 from safetensors.torch import safe_open, save_file
 
+from security import validate_path, validate_positive_int, validate_divisible
+
 
 mapping = {
     "embed_tokens": ("embed", 0),
@@ -43,15 +45,26 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
         save_path (str): Path to the directory where the converted checkpoint files will be saved.
         n_experts (int): Total number of experts in the model.
         mp (int): Model parallelism factor.
-        
+
     Returns:
         None
     """
+    # Validate numeric arguments before any I/O
+    validate_positive_int(n_experts, "n_experts")
+    validate_positive_int(mp, "model_parallel")
+    validate_divisible(n_experts, mp, "n_experts", "model_parallel")
+
+    # Validate filesystem paths
+    src_dir = validate_path(hf_ckpt_path, must_exist=True, description="--hf-ckpt-path")
+    dst_dir = validate_path(save_path, description="--save-path")
+
     torch.set_num_threads(8)
     n_local_experts = n_experts // mp
     state_dicts = [{} for _ in range(mp)]
 
-    for file_path in tqdm(glob(os.path.join(hf_ckpt_path, "*.safetensors"))):
+    for file_path in tqdm(glob(os.path.join(str(src_dir), "*.safetensors"))):
+        # Validate each discovered file is still inside src_dir
+        validate_path(file_path, must_exist=True, allowed_base=str(src_dir), description="safetensors file")
         with safe_open(file_path, framework="pt", device="cpu") as f:
             for name in f.keys():
                 if "model.layers.61" in name:
@@ -63,29 +76,52 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
                 name = name.replace("mlp", "ffn")
                 name = name.replace("weight_scale_inv", "scale")
                 name = name.replace("e_score_correction_bias", "bias")
-                key = name.split(".")[-2]
-                assert key in mapping, f"Key {key} not found in mapping"
+                parts = name.split(".")
+                if len(parts) < 2:
+                    raise ValueError(
+                        f"Unexpected tensor name format (too few components): {name!r}"
+                    )
+                key = parts[-2]
+                if key not in mapping:
+                    raise ValueError(f"Key {key!r} not found in mapping for tensor {name!r}")
                 new_key, dim = mapping[key]
                 name = name.replace(key, new_key)
                 for i in range(mp):
                     new_param = param
                     if "experts" in name and "shared_experts" not in name:
-                        idx = int(name.split(".")[-3])
+                        expert_parts = name.split(".")
+                        if len(expert_parts) < 3:
+                            raise ValueError(
+                                f"Cannot parse expert index from tensor name: {name!r}"
+                            )
+                        try:
+                            idx = int(expert_parts[-3])
+                        except ValueError:
+                            raise ValueError(
+                                f"Non-integer expert index in tensor name: {name!r}"
+                            )
                         if idx < i * n_local_experts or idx >= (i + 1) * n_local_experts:
                             continue
                     elif dim is not None:
-                        assert param.size(dim) % mp == 0, f"Dimension {dim} must be divisible by {mp}"
+                        if param.size(dim) % mp != 0:
+                            raise ValueError(
+                                f"Dimension {dim} of tensor {name!r} "
+                                f"(size {param.size(dim)}) must be divisible by "
+                                f"model_parallel ({mp})"
+                            )
                         shard_size = param.size(dim) // mp
                         new_param = param.narrow(dim, i * shard_size, shard_size).contiguous()
                     state_dicts[i][name] = new_param
 
-    os.makedirs(save_path, exist_ok=True)
+    os.makedirs(str(dst_dir), exist_ok=True)
 
     for i in trange(mp):
-        save_file(state_dicts[i], os.path.join(save_path, f"model{i}-mp{mp}.safetensors"))
+        save_file(state_dicts[i], os.path.join(str(dst_dir), f"model{i}-mp{mp}.safetensors"))
 
-    for file_path in glob(os.path.join(hf_ckpt_path, "*token*")):
-        new_file_path = os.path.join(save_path, os.path.basename(file_path))
+    for file_path in glob(os.path.join(str(src_dir), "*token*")):
+        # Ensure tokenizer files are inside src_dir before copying
+        validate_path(file_path, must_exist=True, allowed_base=str(src_dir), description="tokenizer file")
+        new_file_path = os.path.join(str(dst_dir), os.path.basename(file_path))
         shutil.copyfile(file_path, new_file_path)
 
 
@@ -96,5 +132,4 @@ if __name__ == "__main__":
     parser.add_argument("--n-experts", type=int, required=True)
     parser.add_argument("--model-parallel", type=int, required=True)
     args = parser.parse_args()
-    assert args.n_experts % args.model_parallel == 0, "Number of experts must be divisible by model parallelism"
     main(args.hf_ckpt_path, args.save_path, args.n_experts, args.model_parallel)

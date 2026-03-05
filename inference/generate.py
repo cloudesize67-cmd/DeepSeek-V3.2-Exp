@@ -9,6 +9,14 @@ from transformers import AutoTokenizer
 from safetensors.torch import load_model
 
 from model import Transformer, ModelArgs
+from security import (
+    enforce_https,
+    validate_path,
+    validate_env_int,
+    sanitize_prompt,
+    check_file_size,
+    MAX_PROMPT_CHARS,
+)
 
 
 def sample(logits, temperature: float = 1.0):
@@ -49,7 +57,11 @@ def generate(
         List[List[int]]: A list of lists containing the generated tokens for each sequence.
     """
     prompt_lens = [len(t) for t in prompt_tokens]
-    assert max(prompt_lens) <= model.max_seq_len, f"Prompt length exceeds model maximum sequence length (max_seq_len={model.max_seq_len})"
+    if max(prompt_lens) > model.max_seq_len:
+        raise ValueError(
+            f"Prompt length {max(prompt_lens)} exceeds model maximum sequence "
+            f"length (max_seq_len={model.max_seq_len})"
+        )
     total_len = min(model.max_seq_len, max_new_tokens + max(prompt_lens))
     tokens = torch.full((len(prompt_tokens), total_len), -1, dtype=torch.long, device="cuda")
     for i, t in enumerate(prompt_tokens):
@@ -97,9 +109,21 @@ def main(
         max_new_tokens (int, optional): Maximum number of new tokens to generate. Defaults to 100.
         temperature (float, optional): Temperature for sampling. Defaults to 1.0.
     """
-    world_size = int(os.getenv("WORLD_SIZE", "1"))
-    rank = int(os.getenv("RANK", "0"))
-    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    # Enforce HTTPS / TLS for all outbound network connections
+    enforce_https()
+
+    # Validate all file-system paths before any I/O
+    ckpt_dir = validate_path(ckpt_path, must_exist=True, description="--ckpt-path")
+    config_file = validate_path(config, must_exist=True, description="--config")
+    if input_file:
+        input_path = validate_path(input_file, must_exist=True, description="--input-file")
+        check_file_size(input_path)
+
+    # Safe environment variable parsing (raises ValueError on bad input)
+    world_size = validate_env_int("WORLD_SIZE", default=1, min_val=1)
+    rank = validate_env_int("RANK", default=0, min_val=0)
+    local_rank = validate_env_int("LOCAL_RANK", default=0, min_val=0)
+
     if world_size > 1:
         dist.init_process_group("nccl")
     global print
@@ -109,33 +133,39 @@ def main(
     torch.set_default_dtype(torch.bfloat16)
     torch.set_num_threads(8)
     torch.manual_seed(33377335)
-    with open(config) as f:
+    with open(config_file) as f:
         args = ModelArgs(**json.load(f))
     print(args)
     with torch.device("cuda"):
         model = Transformer(args)
-    tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
+    tokenizer = AutoTokenizer.from_pretrained(str(ckpt_dir))
     print("load model")
-    load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
+    load_model(model, os.path.join(str(ckpt_dir), f"model{rank}-mp{world_size}.safetensors"))
     print("I'm DeepSeek 👋")
 
     if interactive:
         messages = []
         while True:
             if world_size == 1:
-                prompt = input(">>> ")
+                raw_prompt = input(">>> ")
             elif rank == 0:
-                prompt = input(">>> ")
-                objects = [prompt]
+                raw_prompt = input(">>> ")
+                objects = [raw_prompt]
                 dist.broadcast_object_list(objects, 0)
             else:
                 objects = [None]
                 dist.broadcast_object_list(objects, 0)
-                prompt = objects[0]
-            if prompt == "/exit":
+                raw_prompt = objects[0]
+            if raw_prompt == "/exit":
                 break
-            elif prompt == "/clear":
+            elif raw_prompt == "/clear":
                 messages.clear()
+                continue
+            # Sanitize prompt: strip control characters, enforce length limit
+            try:
+                prompt = sanitize_prompt(raw_prompt, max_chars=MAX_PROMPT_CHARS)
+            except ValueError as exc:
+                print(f"[Warning] {exc}")
                 continue
             messages.append({"role": "user", "content": prompt})
             prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
@@ -144,9 +174,13 @@ def main(
             print(completion)
             messages.append({"role": "assistant", "content": completion})
     else:
-        with open(input_file) as f:
+        with open(input_path) as f:
             prompts = f.read().split("\n\n")
-        assert len(prompts) <= args.max_batch_size, f"Number of prompts exceeds maximum batch size ({args.max_batch_size})"
+        if len(prompts) > args.max_batch_size:
+            raise ValueError(
+                f"Number of prompts ({len(prompts)}) exceeds maximum batch size "
+                f"({args.max_batch_size})"
+            )
         prompt_tokens = [tokenizer.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True) for prompt in prompts]
         completion_tokens = generate(model, prompt_tokens, max_new_tokens, tokenizer.eos_token_id, temperature)
         completions = tokenizer.batch_decode(completion_tokens, skip_special_tokens=True)
@@ -172,7 +206,7 @@ if __name__ == "__main__":
         --temperature (float, optional): Temperature for sampling. Defaults to 0.2.
 
     Raises:
-        AssertionError: If neither input-file nor interactive mode is specified.
+        ValueError: If neither input-file nor interactive mode is specified.
     """
     parser = ArgumentParser()
     parser.add_argument("--ckpt-path", type=str, required=True)
@@ -182,5 +216,6 @@ if __name__ == "__main__":
     parser.add_argument("--max-new-tokens", type=int, default=200)
     parser.add_argument("--temperature", type=float, default=0.6)
     args = parser.parse_args()
-    assert args.input_file or args.interactive, "Either input-file or interactive mode must be specified"
+    if not args.input_file and not args.interactive:
+        raise ValueError("Either --input-file or --interactive must be specified")
     main(args.ckpt_path, args.config, args.input_file, args.interactive, args.max_new_tokens, args.temperature)
