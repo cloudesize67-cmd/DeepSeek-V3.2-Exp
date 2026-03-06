@@ -1,0 +1,31 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Security / audit artefacts
+audit.log
+bandit-report.json
+pip-audit-report.json
+.secrets.baseline
+
+# Distribution / build
+dist/
+build/
+*.egg-info/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
