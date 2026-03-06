@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from argparse import ArgumentParser
 from typing import List
 
@@ -9,6 +10,7 @@ from transformers import AutoTokenizer
 from safetensors.torch import load_model
 
 from model import Transformer, ModelArgs
+from security import SecurityContext
 
 
 def sample(logits, temperature: float = 1.0):
@@ -85,6 +87,8 @@ def main(
     interactive: bool = True,
     max_new_tokens: int = 100,
     temperature: float = 1.0,
+    audit_log: str = "audit.log",
+    token_budget: int = 50_000,
 ) -> None:
     """
     Main function to load the model and perform interactive or batch text generation.
@@ -96,6 +100,8 @@ def main(
         interactive (bool, optional): Whether to run in interactive mode. Defaults to True.
         max_new_tokens (int, optional): Maximum number of new tokens to generate. Defaults to 100.
         temperature (float, optional): Temperature for sampling. Defaults to 1.0.
+        audit_log (str, optional): Path for the structured security audit log. Defaults to "audit.log".
+        token_budget (int, optional): Per-session token budget for rate limiting. Defaults to 50000.
     """
     world_size = int(os.getenv("WORLD_SIZE", "1"))
     rank = int(os.getenv("RANK", "0"))
@@ -109,8 +115,22 @@ def main(
     torch.set_default_dtype(torch.bfloat16)
     torch.set_num_threads(8)
     torch.manual_seed(33377335)
+
+    # ── Security: validate paths and config before loading ───────────────────
+    sec = SecurityContext(
+        audit_log_path=audit_log,
+        token_budget=token_budget,
+        log_to_stderr=(rank == 0),
+    )
+    ckpt_path = sec.safe_path(ckpt_path)
+    config    = sec.safe_path(config)
+
     with open(config) as f:
-        args = ModelArgs(**json.load(f))
+        config_dict = json.load(f)
+    sec.validate_config(config_dict)          # raises ConfigValidationError on bad values
+    args = ModelArgs(**config_dict)
+    # ────────────────────────────────────────────────────────────────────────
+
     print(args)
     with torch.device("cuda"):
         model = Transformer(args)
@@ -120,6 +140,7 @@ def main(
     print("I'm DeepSeek 👋")
 
     if interactive:
+        session_id = sec.new_session()
         messages = []
         while True:
             if world_size == 1:
@@ -132,27 +153,69 @@ def main(
                 objects = [None]
                 dist.broadcast_object_list(objects, 0)
                 prompt = objects[0]
+
             if prompt == "/exit":
                 break
             elif prompt == "/clear":
                 messages.clear()
                 continue
+
+            # ── Security: input inspection ───────────────────────────────
+            estimated_tokens = len(prompt) // 4  # ~4 chars per token heuristic
+            threat = sec.check_input(session_id, prompt, estimated_tokens)
+            if threat.blocked:
+                print(f"[BLOCKED] {threat.threat_type}: {threat.detail}")
+                continue
+            # ─────────────────────────────────────────────────────────────
+
             messages.append({"role": "user", "content": prompt})
+            # Guard context-window history growth
+            if len(messages) > 2 * 50:  # 50 turns = 100 message objects
+                messages = messages[-100:]
+
+            request_id = sec.new_request_id()
+            t0 = time.monotonic()
             prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
             completion_tokens = generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature)
             completion = tokenizer.decode(completion_tokens[0], skip_special_tokens=True)
-            print(completion)
-            messages.append({"role": "assistant", "content": completion})
+            latency_ms = (time.monotonic() - t0) * 1000
+
+            # ── Security: output filtering ───────────────────────────────
+            safe_completion = sec.filter_output(session_id, request_id, completion, latency_ms)
+            # ─────────────────────────────────────────────────────────────
+
+            print(safe_completion)
+            messages.append({"role": "assistant", "content": safe_completion})
     else:
         with open(input_file) as f:
             prompts = f.read().split("\n\n")
         assert len(prompts) <= args.max_batch_size, f"Number of prompts exceeds maximum batch size ({args.max_batch_size})"
-        prompt_tokens = [tokenizer.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True) for prompt in prompts]
+
+        session_id = sec.new_session()
+        safe_prompts: List[str] = []
+        for prompt in prompts:
+            threat = sec.check_input(session_id, prompt, len(prompt) // 4)
+            if threat.blocked:
+                print(f"[SKIPPED] {threat.threat_type}: {threat.detail}")
+                safe_prompts.append("")  # placeholder so indices align
+            else:
+                safe_prompts.append(prompt)
+
+        prompt_tokens = [
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}], add_generation_prompt=True
+            ) for p in safe_prompts
+        ]
+        t0 = time.monotonic()
         completion_tokens = generate(model, prompt_tokens, max_new_tokens, tokenizer.eos_token_id, temperature)
+        latency_ms = (time.monotonic() - t0) * 1000
         completions = tokenizer.batch_decode(completion_tokens, skip_special_tokens=True)
-        for prompt, completion in zip(prompts, completions):
+
+        for prompt, completion in zip(safe_prompts, completions):
+            request_id = sec.new_request_id()
+            safe_completion = sec.filter_output(session_id, request_id, completion, latency_ms)
             print("Prompt:", prompt)
-            print("Completion:", completion)
+            print("Completion:", safe_completion)
             print()
 
     if world_size > 1:
@@ -181,6 +244,11 @@ if __name__ == "__main__":
     parser.add_argument("--interactive", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=200)
     parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--audit-log", type=str, default="audit.log",
+                        help="Path for structured security audit log")
+    parser.add_argument("--token-budget", type=int, default=50_000,
+                        help="Per-session token budget for rate limiting")
     args = parser.parse_args()
     assert args.input_file or args.interactive, "Either input-file or interactive mode must be specified"
-    main(args.ckpt_path, args.config, args.input_file, args.interactive, args.max_new_tokens, args.temperature)
+    main(args.ckpt_path, args.config, args.input_file, args.interactive,
+         args.max_new_tokens, args.temperature, args.audit_log, args.token_budget)

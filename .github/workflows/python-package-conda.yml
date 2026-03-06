@@ -32,3 +32,90 @@ jobs:
       run: |
         conda install pytest
         pytest
+
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: build-linux
+    name: Security Analysis
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v3
+      with:
+        python-version: '3.10'
+
+    - name: Install security tools
+      run: |
+        pip install bandit[toml] safety pip-audit
+
+    - name: Static security analysis (Bandit — OWASP/CWE checks)
+      # Checks for: B101 assert-used, B105/B106/B107 hardcoded passwords,
+      # B110 try-except-pass, B602/B603 subprocess/shell injection, etc.
+      run: |
+        bandit -r inference/ \
+          --severity-level medium \
+          --confidence-level medium \
+          --format json \
+          --output bandit-report.json \
+          || true
+        bandit -r inference/ \
+          --severity-level high \
+          --confidence-level high \
+          --exit-zero
+
+    - name: Upload Bandit report
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: bandit-security-report
+        path: bandit-report.json
+
+    - name: Dependency vulnerability audit (pip-audit)
+      # Checks installed packages against OSV / PyPA advisory databases
+      run: |
+        pip install -r inference/requirements.txt --quiet || true
+        pip-audit --format json --output pip-audit-report.json \
+          --ignore-vuln PYSEC-2022-42969 \
+          || true
+        pip-audit --desc --strict \
+          --ignore-vuln PYSEC-2022-42969 \
+          || echo "::warning::pip-audit found advisories — review pip-audit-report.json"
+
+    - name: Upload pip-audit report
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: pip-audit-report
+        path: pip-audit-report.json
+
+    - name: Secret scanning (detect hardcoded credentials)
+      run: |
+        pip install detect-secrets
+        detect-secrets scan --all-files \
+          --exclude-files '\.git/.*' \
+          --exclude-files '.*\.pdf' \
+          --exclude-files '.*\.jpg' \
+          > .secrets.baseline 2>&1 || true
+        # Fail if high-confidence secrets are detected
+        python - <<'EOF'
+        import json, sys
+        with open(".secrets.baseline") as f:
+            baseline = json.load(f)
+        results = baseline.get("results", {})
+        high_conf = [
+            (fp, s) for fp, secrets in results.items()
+            for s in secrets if s.get("is_verified") or s.get("type") in
+            ("Hex High Entropy String", "Base64 High Entropy String", "AWS Access Key")
+        ]
+        if high_conf:
+            for fp, s in high_conf:
+                print(f"::error file={fp}::Potential secret: {s['type']} at line {s['line_number']}")
+            sys.exit(1)
+        EOF
+
+    - name: Security unit tests
+      run: |
+        pip install pytest
+        pytest inference/tests/test_security.py -v --tb=short
